@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 · AI智脑Pro
 // @namespace    https://github.com/Z-Fovik-RT/chaoxing-ai
-// @version      1.3.14.3
+// @version      1.3.14.4
 // @description  学习通AI智脑Pro | AI+题库双引擎自动答题 | 视频音频倍速播放 | 字体解密 | 章节自动导航 | 粘贴限制绕过 | 题目一键复制 | 反检测增强 | 作业/考试全自动 | 截图OCR搜题
 // @author       Z-Fovik-RT
 // @homepage     https://github.com/Z-Fovik-RT/chaoxing-ai
@@ -5305,6 +5305,20 @@ function cxai_toNext() {
         let _curIndex = _t.findIndex((item) => item['curid'] == _curChaterId)
         // 找不到当前章节时从列表头开始，避免 _t[-1] 取到 undefined 后崩溃
         if (_curIndex < 0) _curIndex = 0
+
+        // 优先回补当前章节之前的未完成任务点（例如视频网络错误导致被跳过）
+        var _backfill = cxai_findPrevUnfinished(_t, _curIndex)
+        if (_backfill) {
+            cxai_logger('发现前面有未完成任务点：' + _backfill.name + '，返回补刷', 'orange')
+            setTimeout(function () {
+                if (!cxai_gotoCatalog(_backfill.curid)) {
+                    cxai_logger('返回该任务点失败，继续向后处理', 'red')
+                    cxai_toNext()
+                }
+            }, 3000)
+            return
+        }
+
         for (_curIndex; _curIndex < _t.length - 1; _curIndex++) {
             // 当前章节仍标记为待完成，但章节内已无更多页面（hasNext=false 已在前面判定过）
             // 此分支保留作为兜底：万一 detectSubTabPosition 漏检，仍尝试调用一次
@@ -5442,6 +5456,111 @@ function cxai_refreshCourseList() {
 //  视频播放控制、倍速锁定、播放速率检测
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// 视频播放“网络错误导致视频下载中途失败”时，自动轮换线路（公网1/公网2/本校…）
+function cxai_handleVideoNetworkError(doc) {
+    try {
+        if (!doc || !doc.body) return false;
+        var bodyText = doc.body.innerText || '';
+        if (bodyText.indexOf('尝试其他线路') === -1 && bodyText.indexOf('下载中途失败') === -1) return false;
+
+        // 找出线路选项：文本为 公网1 / 公网2 / 本校 / 线路1 之类的最内层节点
+        var lineEls = [];
+        var nodes = doc.body.querySelectorAll('label,div,span,li,a,p');
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var t = (el.textContent || '').replace(/\s/g, '');
+            if (!t || t.length > 8) continue;
+            if (!/^(公网\d+|本校|线路\d+|备用\d+)$/.test(t)) continue;
+            if (el.querySelector('label,div,span,li,a,p,input')) continue;
+            lineEls.push(el);
+        }
+        if (lineEls.length === 0) return false;
+        if (lineEls.length === 1) { lineEls[0].click(); return true; }
+
+        // 当前选中项
+        var checkedIdx = -1;
+        for (var j = 0; j < lineEls.length; j++) {
+            var p = lineEls[j].parentElement;
+            if (p && p.querySelector('input[type=radio]:checked')) { checkedIdx = j; break; }
+        }
+
+        // 4 秒冷却，避免短时间反复点击
+        var now = Date.now();
+        if (window._cxaiLineTick && now - window._cxaiLineTick < 4000) return false;
+        window._cxaiLineTick = now;
+
+        // 轮换到下一个未试过的线路
+        if (!window._cxaiLineTried) window._cxaiLineTried = {};
+        var ukey = String(location.pathname);
+        var tried = window._cxaiLineTried[ukey] || [];
+        var next = -1;
+        for (var k = 1; k <= lineEls.length; k++) {
+            var cand = (checkedIdx + k + lineEls.length) % lineEls.length;
+            if (tried.indexOf(cand) === -1) { next = cand; break; }
+        }
+        if (next === -1) {
+            window._cxaiLineTried[ukey] = [];
+            tried = window._cxaiLineTried[ukey];
+            next = (checkedIdx + 1) % lineEls.length;
+        }
+        tried.push(next);
+
+        var target = lineEls[next];
+        try { target.click(); } catch (_e) { /* ignore */ }
+        try {
+            var radios = (target.parentElement || doc).querySelectorAll('input[type=radio]');
+            if (radios && radios[next]) radios[next].click();
+        } catch (_e) { /* ignore */ }
+        cxai_logger('视频网络错误，已切换线路：' + (target.textContent || '').trim(), 'orange');
+
+        // 切换线路后播放器会重建，重新接管播放
+        setTimeout(function () {
+            try {
+                var v = doc.querySelector('video') || doc.querySelector('audio');
+                if (v) {
+                    v.muted = true;
+                    try { v.playbackRate = cxai_getRate(); } catch (_e) { /* ignore */ }
+                    v.play();
+                }
+            } catch (_e) { /* ignore */ }
+        }, 6000);
+        return true;
+    } catch (_e) { return false; }
+}
+
+// 在目录列表中查找“当前章节之前仍未完成”的任务点
+function cxai_findPrevUnfinished(list, curIndex) {
+    try {
+        if (!list || !list.length) return null;
+        if (!window._cxaiBackfillTried) window._cxaiBackfillTried = {};
+        for (var i = 0; i < curIndex; i++) {
+            var it = list[i];
+            if (!it || !it.curid) continue;
+            if ((it.status || '').indexOf('待完成') === -1) continue;
+            var n = window._cxaiBackfillTried[it.curid] || 0;
+            if (n >= 2) continue;
+            window._cxaiBackfillTried[it.curid] = n + 1;
+            return it;
+        }
+    } catch (_e) { /* ignore */ }
+    return null;
+}
+
+// 点击目录中的指定章节，用于回补前面的未完成任务点
+function cxai_gotoCatalog(curid) {
+    try {
+        var pd = (window.parent && window.parent.document) ? window.parent.document : document;
+        var root = pd.querySelector('#coursetree') || pd;
+        var sel = root.querySelector('#' + curid);
+        if (sel) {
+            var nameEl = sel.querySelector('.posCatalog_name') || sel;
+            nameEl.click();
+            return true;
+        }
+    } catch (_e) { /* ignore */ }
+    return false;
+}
+
 function cxai_missonVideo(dom, obj) {
     const { isPassed, otherInfo, property } = obj;
     const { _jobid: jobId, name, objectid: objectId, module } = property;
@@ -5546,11 +5665,18 @@ function cxai_missonVideo(dom, obj) {
                     cxai_logger('视频弹题已处理', 'blue');
                 }
             }, 5000);
+
+            // 视频网络错误自动切换线路（定时器在 ended 时清理）
+            var netErrorTimer = setInterval(function () {
+                cxai_handleVideoNetworkError(doc);
+            }, 4000);
+
             media.addEventListener('ended', () => {
                 cxai_logger(`${name} - ${mediaType} 已播放完成`);
                 media.removeEventListener('pause', resume);
                 clearInterval(intervalId);
                 clearInterval(videoQuizTimer);
+                clearInterval(netErrorTimer);
                 setTimeout(cxai_switchMission, 1000);
             });
         }
