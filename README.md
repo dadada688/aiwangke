@@ -1,4 +1,4 @@
-# 学习通 · AI智脑Pro（视频弹题修复版）
+# 学习通 · AI智脑Pro（改进版）
 
 一个运行在浏览器里的用户脚本（Userscript），用于辅助学习通章节视频播放与答题。
 本仓库基于 [Z-Fovik-RT/chaoxing-ai](https://github.com/Z-Fovik-RT/chaoxing-ai) 修改，采用 MIT License，保留原作者署名。
